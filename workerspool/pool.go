@@ -2,18 +2,18 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"sync"
-	"time"
 )
 
-var ErrFull = errors.New("buffer full")
-var ErrClosed = errors.New("shutting down")
+var (
+	ErrFull   = errors.New("buffer full")
+	ErrClosed = errors.New("shutting down")
+)
 
 type Pool struct {
 	maxBufSize uint
 
-	runnig bool
+	running bool
 
 	m *sync.Mutex
 
@@ -27,7 +27,7 @@ func (p *Pool) AddJob(j Job) error {
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	if !p.runnig {
+	if !p.running {
 		return ErrClosed
 	}
 
@@ -44,12 +44,12 @@ func (p *Pool) AddJob(j Job) error {
 func (p *Pool) Close() {
 	p.m.Lock()
 
-	if !p.runnig {
+	if !p.running {
 		p.m.Unlock()
 		return
 	}
 
-	p.runnig = false
+	p.running = false
 
 	close(p.jobs)
 
@@ -61,7 +61,7 @@ func (p *Pool) Close() {
 func NewPool(workersCount uint) *Pool {
 	p := Pool{
 		maxBufSize: workersCount,
-		runnig:     true,
+		running:    true,
 		m:          &sync.Mutex{},
 		jobs:       make(chan Job, workersCount),
 		wg:         &sync.WaitGroup{},
@@ -85,23 +85,5 @@ func (p *Pool) worker() {
 		p.m.Unlock()
 
 		j.Do()
-	}
-}
-
-type Job struct {
-	id     uint32
-	period time.Duration
-}
-
-func (j Job) Do() {
-	time.Sleep(j.period)
-
-	fmt.Printf("job %d is done\n", j.id)
-}
-
-func NewJob(id, p uint32) Job {
-	return Job{
-		id:     id,
-		period: time.Duration(p) * time.Millisecond,
 	}
 }
