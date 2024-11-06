@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"golang.org/x/sync/singleflight"
 )
 
 /*
@@ -29,21 +31,23 @@ type (
 	}
 
 	Cache struct {
-		src  Datasource
-		cap  uint
-		m    *sync.RWMutex
-		lru  *list.List
-		data map[string]*node
+		src   Datasource
+		cap   uint
+		group *singleflight.Group
+		m     *sync.RWMutex
+		lru   *list.List
+		data  map[string]*node
 	}
 )
 
 func NewCache(src Datasource, cap uint) *Cache {
 	return &Cache{
-		src:  src,
-		cap:  cap,
-		m:    new(sync.RWMutex),
-		lru:  list.New(),
-		data: make(map[string]*node, cap),
+		src:   src,
+		cap:   cap,
+		group: new(singleflight.Group),
+		m:     new(sync.RWMutex),
+		lru:   list.New(),
+		data:  make(map[string]*node, cap),
 	}
 }
 
@@ -61,49 +65,54 @@ func (c *Cache) dropLRU() {
 }
 
 func (c *Cache) Get(ctx context.Context, key string) (string, error) {
-	var (
-		val   string
-		found bool
-	)
+	res, err, _ := c.group.Do(key, func() (any, error) {
+		var (
+			val   string
+			found bool
+		)
 
-	doWithLock(
-		c.m.RLocker(),
-		func() {
-			res, ok := c.data[key]
-			if !ok {
-				return
-			}
+		doWithLock(
+			c.m.RLocker(),
+			func() {
+				res, ok := c.data[key]
+				if !ok {
+					return
+				}
 
-			c.lru.MoveToFront(res.ptr)
-			val = res.data
-			found = true
-		},
-	)
+				c.lru.MoveToFront(res.ptr)
+				val = res.data
+				found = true
+			},
+		)
 
-	if found {
-		return val, nil
+		if found {
+			return val, nil
+		}
+
+		val, err := c.src.Get(ctx, key)
+		if err != nil {
+			return "", fmt.Errorf("fetch value from datasource: %w", err)
+		}
+
+		doWithLock(
+			c.m,
+			func() {
+				if int(c.cap) == len(c.data) {
+					c.dropLRU()
+				}
+
+				c.data[key] = &node{data: val, ptr: c.lru.PushFront(key)}
+			},
+		)
+
+		return val, err
+	})
+
+	if err != nil {
+		return "", nil
 	}
 
-	var err error
-
-	doWithLock(
-		c.m,
-		func() {
-			if int(c.cap) == len(c.data) {
-				c.dropLRU()
-			}
-
-			val, err = c.src.Get(ctx, key)
-			if err != nil {
-				err = fmt.Errorf("fetch value from datasource: %w", err)
-				return
-			}
-
-			c.data[key] = &node{data: val, ptr: c.lru.PushFront(key)}
-		},
-	)
-
-	return val, err
+	return res.(string), nil
 }
 
 func (c *Cache) MGet(ctx context.Context, keys []string) ([]*string, error) {
@@ -130,20 +139,14 @@ func (c *Cache) MGet(ctx context.Context, keys []string) ([]*string, error) {
 	)
 
 	if len(notCached) > 0 {
-		var err error
+		raw, err := c.src.MGet(ctx, notCached)
+		if err != nil {
+			return nil, fmt.Errorf("fetch values from datasource: %w", err)
+		}
 
 		doWithLock(
 			c.m,
 			func() {
-				var raw []*string
-
-				raw, err = c.src.MGet(ctx, notCached)
-				if err != nil {
-					err = fmt.Errorf("fetch values from datasource: %w", err)
-
-					return
-				}
-
 				for i, key := range notCached {
 					if int(c.cap) == len(c.data) {
 						c.dropLRU()
@@ -155,10 +158,6 @@ func (c *Cache) MGet(ctx context.Context, keys []string) ([]*string, error) {
 				}
 			},
 		)
-
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	res := make([]*string, 0, len(keys))
